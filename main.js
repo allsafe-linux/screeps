@@ -1,4 +1,4 @@
-// ===================== 全局配置 (整合优化) =====================
+
 const GLOBAL_CONFIG = {
     HOME_ROOM: 'W13S59',
     LAB_RECIPES: [
