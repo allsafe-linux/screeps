@@ -349,7 +349,7 @@ var CreepLogic = {
         if (room.storage && ToolUtil.doAction(creep, room.storage, creep.transfer, '#ffaa00', ['存矿到仓库'], 50)) return;
     },
 
-    // ========== 修复后的 transporter 方法 ==========
+    // ========== 修复语法错误后的 transporter 方法 ==========
     transporter: function(creep) {
         var room = creep.room;
         var RES_TYPE = RESOURCE_ENERGY;
@@ -393,8 +393,12 @@ var CreepLogic = {
 
             var target = null;
             
-            // 优先级1：强制优先处理指定坐标的spawn旁link（30,24）
-            var spawnLink = Game.getObjectById(SPAWN_LINK_POS.lookFor(LOOK_STRUCTURES)[0]?.id);
+            // 优先级1：强制优先处理指定坐标的spawn旁link（30,24）【修复ES5兼容问题】
+            var spawnLinkStructures = SPAWN_LINK_POS.lookFor(LOOK_STRUCTURES);
+            var spawnLink = null;
+            if (spawnLinkStructures.length > 0) {
+                spawnLink = Game.getObjectById(spawnLinkStructures[0].id);
+            }
             if (spawnLink && spawnLink.structureType === STRUCTURE_LINK && spawnLink.store.getUsedCapacity(RES_TYPE) > 0) {
                 target = spawnLink;
                 lockTarget(target, 'withdraw');
@@ -594,15 +598,19 @@ var CreepLogic = {
         }
     },
 
-    // ========== 修复后的 upgrader 方法 ==========
+    // ========== 修复语法错误后的 upgrader 方法 ==========
     upgrader: function(creep) {
         var room = creep.room;
         // 关键：指定controller旁link的坐标（5,6），强制优先取能
         var CTRL_LINK_POS = new RoomPosition(5, 6, room.name);
 
         if (!creep.memory.working) {
-            // 优先级1：强制优先从指定坐标的controller旁link取能
-            var ctrlLink = Game.getObjectById(CTRL_LINK_POS.lookFor(LOOK_STRUCTURES)[0]?.id);
+            // 优先级1：强制优先从指定坐标的controller旁link取能【修复ES5兼容问题】
+            var ctrlLinkStructures = CTRL_LINK_POS.lookFor(LOOK_STRUCTURES);
+            var ctrlLink = null;
+            if (ctrlLinkStructures.length > 0) {
+                ctrlLink = Game.getObjectById(ctrlLinkStructures[0].id);
+            }
             if (ctrlLink && ctrlLink.structureType === STRUCTURE_LINK && ctrlLink.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
                 if (ToolUtil.doAction(creep, ctrlLink, creep.withdraw, '#66ff66', ['取控制器链路'], 50)) {
                     return;
