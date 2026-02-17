@@ -1,691 +1,844 @@
 /**
- * Screeps RCL5 专用代码 - 动态source分配（任务完成后调整）+ 负载均衡 + 调整冷却
- * 核心优化：1. 任务完成后才重新分配source；2. 增加调整冷却，避免频繁切换；3. 保留负载均衡+距离优先
- * 新增优化：3个Link智能互通有无，按优先级调度能量传输
+ * Screeps RCL5+ 专用代码 - 工业革命版 V4
+ * 优化物流、启用 Terminal/Lab、全自动 Z 矿开采
+ * 整合修复：Terminal冷却检查、Z矿自动出售、错误日志兼容
+ * 最终版：Creep任务中文简略显示 + 仅显示2秒钟
  */
 
-// ===================== 通用工具类 =====================
+// ===================== 全局配置 (整合优化) =====================
+const GLOBAL_CONFIG = {
+    HOME_ROOM: 'W13S59',
+    // Lab 配方配置 (示例: 合成氧化氢)
+    LAB_RECIPES: [
+        {id: 'GHOUL', result: RESOURCE_GHODIUM, in: [RESOURCE_ZYNTHIUM, RESOURCE_ZYNTHIUM]}
+    ],
+    // Terminal 自动交易配置 (整合修复后的参数)
+    TERMINAL: {
+        SELL_ZYNTHIUM_THRESHOLD: 5000,  // 超过5000就卖
+        KEEP_ZYNTHIUM: 1000,            // 保留供Lab使用的数量
+        MIN_PRICE: 0.5,                 // Z矿最低可接受单价（credits/单位）
+        MAX_SINGLE_SELL: 5000,          // 单次最大出售量（市场上限）
+        KEEP_ENERGY: 50000,             // 终端保留基础能量
+        COOLDOWN_CHECK: true            // 启用Terminal冷却检查
+    }
+};
+
+// ===================== 通用工具类 (增强版 + 补全逻辑) =====================
 var ToolUtil = {
+    // 目标有效性校验
     isTargetValid: function(target) {
         return target && target.id && !target.destroyed && !target.dead;
     },
 
+    // Creep对话（中文任务描述 + 仅显示2秒钟）
     sayWithDuration: function(creep, textList) {
         var texts = Array.isArray(textList) ? textList : [textList];
         var randomText = texts[Math.floor(Math.random() * texts.length)];
         var lastSayTick = creep.memory.lastSayTick || 0;
+        
+        // 核心逻辑：仅在间隔>2tick时显示，2秒到期后清空
         if (Game.time - lastSayTick > 2) {
             creep.say(randomText);
             creep.memory.lastSayTick = Game.time;
+        } else if (Game.time - lastSayTick === 2) {
+            creep.say('');
         }
     },
 
+    // 移动配置（复用路径+优先道路）
     getMoveOpts: function(reusePath) {
         return {
             reusePath: reusePath || 50,
             preferRoads: true,
             avoidCreeps: true,
-            serializeMemory: false
+            serializeMemory: false,
+            visualizePathStyle: { stroke: '#ffffff', opacity: 0.7, lineStyle: 'dashed' }
         };
     },
 
-    doAction: function(creep, target, action, color, sayTextList, reusePath) {
+    // 通用行动执行（挖矿/运输/建造等）
+    doAction: function(creep, target, action, color, sayTextList, reusePath, resourceType) {
         if (!this.isTargetValid(target)) return false;
         this.sayWithDuration(creep, sayTextList);
-        var err = action.call(creep, target, RESOURCE_ENERGY);
+        var resType = resourceType || RESOURCE_ENERGY;
+        var err = action.call(creep, target, resType);
         if (err === ERR_NOT_IN_RANGE) {
             creep.moveTo(target, this.getMoveOpts(reusePath));
         }
         return err === OK;
     },
 
-    // 核心重构：任务完成后才重新分配source + 调整冷却
-    assignSource: function(creep, room) {
-        // 配置项：调整冷却时间（tick），避免频繁切换
-        const SOURCE_CHANGE_COOLDOWN = 50;
-        // 任务完成判定：采集态creep能量满 / 目标source失效 / 冷却到期
-        const isTaskCompleted = () => {
-            // 1. 当前source无效（被摧毁/不存在）
-            if (creep.memory.currentSourceTaskId) {
-                const currentSource = Game.getObjectById(creep.memory.currentSourceTaskId);
-                if (!this.isTargetValid(currentSource)) return true;
-            }
-            // 2. 采集态creep能量已满（完成采集任务）
-            if (!creep.memory.working && creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0) return true;
-            // 3. 强制冷却到期（防止极端情况一直卡任务）
-            if (creep.memory.sourceChangeCooldown && Game.time > creep.memory.sourceChangeCooldown) return true;
-            // 任务未完成
-            return false;
-        };
+    // 补全：矿源负载均衡分配
+		assignSource: function(creep, room) {
+		    const SOURCE_CHANGE_COOLDOWN = 50;
+		    const isTaskCompleted = function() {
+		        if (creep.memory.currentSourceTaskId) {
+		            const currentSource = Game.getObjectById(creep.memory.currentSourceTaskId);
+		            if (!ToolUtil.isTargetValid(currentSource)) return true;
+		        }
+		        if (!creep.memory.working && creep.store.getFreeCapacity(RESOURCE_ENERGY) === 0) return true;
+		        if (creep.memory.sourceChangeCooldown && Game.time > creep.memory.sourceChangeCooldown) return true;
+		        return false;
+		    };
 
-        // 1. 实时获取房间内所有有效source
-        var allSources = room.find(FIND_SOURCES, {
-            filter: s => this.isTargetValid(s)
+		    var allSources = room.find(FIND_SOURCES, {
+		        filter: function(s) { return ToolUtil.isTargetValid(s); }
+		    });
+		    if (allSources.length === 0) {
+		        console.log(`[${creep.name}] 房间${room.name}无可用矿源！`);
+		        return null;
+		    }
+
+		    // 关键修复：移除「未完成任务则返回缓存」的逻辑，强制检查矿源有效性
+		    let currentSource = null;
+		    if (creep.memory.currentSourceTaskId) {
+		        currentSource = Game.getObjectById(creep.memory.currentSourceTaskId);
+		    }
+		    // 只有缓存矿源有效且未到冷却期，才复用
+		    if (!isTaskCompleted() && ToolUtil.isTargetValid(currentSource) && allSources.some(s => s.id === currentSource.id)) {
+		        if (Game.time % 10 === 0) {
+		            console.log(`[${creep.name}] 继续采集矿源[${currentSource.pos.x},${currentSource.pos.y}]`);
+		        }
+		        return currentSource;
+		    }
+
+		    // 计算矿源负载（采集者数量+距离）
+		    var sourceLoad = {};
+		    allSources.forEach(function(s) {
+		        sourceLoad[s.id] = {
+		            count: 0,
+		            source: s,
+		            distance: creep.pos.getRangeTo(s)
+		        };
+		    });
+
+		    var harvesterRoles = ['harvester', 'upgrader'];
+		    // 修复：遍历Game.creeps而非room.find，避免漏统计
+		    for (const name in Game.creeps) {
+		        const creepIter = Game.creeps[name];
+		        if (creepIter.room.name === room.name && harvesterRoles.includes(creepIter.memory.role) && creepIter.memory.currentSourceTaskId) {
+		            if (sourceLoad[creepIter.memory.currentSourceTaskId]) {
+		                sourceLoad[creepIter.memory.currentSourceTaskId].count++;
+		            }
+		        }
+		    }
+
+		    // 选择负载最低、距离最近的矿源
+		    var bestSource = _.min(allSources, function(s) {
+		        return sourceLoad[s.id].count * 10 + sourceLoad[s.id].distance;
+		    });
+
+		    // 分配矿源并设置冷却
+		    creep.memory.currentSourceTaskId = bestSource.id;
+		    creep.memory.sourceChangeCooldown = Game.time + SOURCE_CHANGE_COOLDOWN;
+		    console.log(`[${creep.name}] 分配新矿源：[${bestSource.pos.x},${bestSource.pos.y}]`);
+		    return bestSource;
+		},
+
+    // 补全：Z矿分配逻辑
+    assignZynthiumMineral: function(creep, room) {
+        const zMinerals = room.find(FIND_MINERALS, {
+            filter: m => m.mineralType === RESOURCE_ZYNTHIUM && m.mineralAmount > 0
         });
-        if (allSources.length === 0) return null;
-
-        // 2. 如果任务未完成且当前source有效，继续使用当前source
-        if (!isTaskCompleted() && creep.memory.currentSourceTaskId) {
-            const currentSource = Game.getObjectById(creep.memory.currentSourceTaskId);
-            if (this.isTargetValid(currentSource) && allSources.some(s => s.id === currentSource.id)) {
-                // 输出保持当前任务的日志（简化版，避免刷屏）
-                if (Game.time % 10 === 0) {
-                    console.log(`[${creep.name}] 继续执行当前采集任务：[${currentSource.pos.x},${currentSource.pos.y}]`);
-                }
-                return currentSource;
-            }
-        }
-
-        // 3. 任务完成/冷却到期，重新分配source（负载均衡+距离优先）
-        // 3.1 实时统计每个source的当前采集者数量
-        var sourceLoad = {};
-        allSources.forEach(s => {
-            sourceLoad[s.id] = {
-                count: 0,
-                source: s,
-                distance: creep.pos.getRangeTo(s)
-            };
-        });
-
-        // 3.2 统计实际负载（仅计入正在采集且任务未完成的creep）
-        var harvesterRoles = ['harvester', 'upgrader'];
-        var allGatherers = room.find(FIND_MY_CREEPS, {
-            filter: c => harvesterRoles.includes(c.memory.role) && this.isTargetValid(c)
-        });
-        allGatherers.forEach(gatherer => {
-            if (gatherer.memory.currentSourceTaskId && sourceLoad[gatherer.memory.currentSourceTaskId]) {
-                if (gatherer.pos.getRangeTo(sourceLoad[gatherer.memory.currentSourceTaskId].source) <= 1) {
-                    sourceLoad[gatherer.memory.currentSourceTaskId].count++;
-                }
-            }
-        });
-
-        // 3.3 排序：负载最少 → 距离最近
-        var sortedSources = Object.values(sourceLoad).sort((a, b) => {
-            if (a.count !== b.count) return a.count - b.count;
-            return a.distance - b.distance;
-        });
-
-        // 3.4 选择最优source并设置任务状态
-        var bestSource = sortedSources[0].source;
-        creep.memory.currentSourceTaskId = bestSource.id; // 绑定当前任务source
-        creep.memory.sourceChangeCooldown = Game.time + SOURCE_CHANGE_COOLDOWN; // 设置调整冷却
-
-        // 调试日志
-        var loadLog = allSources.map(s => 
-            `[${s.pos.x},${s.pos.y}](${sourceLoad[s.id].count}人, 距离${sourceLoad[s.id].distance})`
-        ).join(' | ');
-        console.log(`[${creep.name}] 任务完成，重新分配source：[${bestSource.pos.x},${bestSource.pos.y}] | 各资源点负载：${loadLog}`);
-
-        return bestSource;
+        if (zMinerals.length === 0) return null;
+        
+        // 优先选择有提取器的Z矿
+        return zMinerals.find(m => {
+            return m.pos.lookFor(LOOK_STRUCTURES).some(s => s.structureType === STRUCTURE_EXTRACTOR);
+        }) || zMinerals[0];
     },
-
-    getNearContainer: function(pos, hasEnergy) {
-        var filter = hasEnergy ? 
-            function(s) { return s.structureType === STRUCTURE_CONTAINER && s.store.getUsedCapacity(RESOURCE_ENERGY) > 0; } :
-            function(s) { return s.structureType === STRUCTURE_CONTAINER && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0; };
-        return pos.findClosestByPath(FIND_STRUCTURES, { filter: filter, limit: 1 });
-    },
-
-    getBodyCost: function(body) {
-        var costMap = { WORK: 100, CARRY: 50, MOVE: 50, ATTACK: 80, TOUGH: 10 };
-        var sum = 0;
-        for (var i = 0; i < body.length; i++) {
-            sum += costMap[body[i]] || 0;
-        }
-        return sum;
-    },
-
-    getEnergyForTransporter: function(creep, reusePath) {
-        var room = creep.room;
-        var spawnLink = room.find(FIND_MY_STRUCTURES, {
-            filter: s => s.structureType === STRUCTURE_LINK && s.pos.findInRange(FIND_MY_SPAWNS, 3).length > 0,
-            limit: 1
+    
+    // 新增：获取指定位置附近的 Container/Link
+    getNearbyStructures: function(pos, structureType, hasEnergy) {
+        return pos.findInRange(FIND_STRUCTURES, 3, {
+            filter: (s) => {
+                if (s.structureType !== structureType) return false;
+                if (hasEnergy === undefined) return true;
+                if (hasEnergy) return s.store.getUsedCapacity(RESOURCE_ENERGY) > 0;
+                return s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
+            }
         })[0];
-        
-        if (spawnLink && this.doAction(creep, spawnLink, creep.withdraw, '#00ffcc', ['🔄从L取能'], reusePath)) return;
-        
-        var container = this.getNearContainer(creep.pos, true);
-        if (container && container.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-            if (this.doAction(creep, container, creep.withdraw, '#ffaa00', ['🔄从C取能'], reusePath)) return;
-        }
-        
-        var storage = room.storage;
-        if (storage) this.doAction(creep, storage, creep.withdraw, '#ffff00', ['🔄从S取能'], reusePath);
     },
 
-    getEnergyForUpgraderAndBuilder: function(creep, reusePath) {
-        var room = creep.room;
-        
-        // upgrader：优先从container取能，其次动态采集source（任务完成后调整）
-        if (creep.memory.role === 'upgrader') {
-            var container = this.getNearContainer(creep.pos, true);
-            if (container && container.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
-                if (this.doAction(creep, container, creep.withdraw, '#ffaa00', ['🔄从C取能'], reusePath)) {
-                    // 取能成功，重置source任务（因为不需要采集了）
-                    delete creep.memory.currentSourceTaskId;
-                    return;
-                }
-            }
-            // 无container，采集source（任务完成后调整）
-            var source = this.assignSource(creep, room);
-            if (source) this.doAction(creep, source, creep.harvest, '#66ff66', ['⛏️自行采集能源'], reusePath);
-            return;
-        }
-
-        // builder逻辑保持不变
-        if (creep.memory.role === 'builder') {
-            var spawnLink = room.find(FIND_MY_STRUCTURES, {
-                filter: s => s.structureType === STRUCTURE_LINK && s.pos.findInRange(FIND_MY_SPAWNS, 3).length > 0,
-                limit: 1
-            })[0];
-            if (spawnLink && this.doAction(creep, spawnLink, creep.withdraw, '#66ff66', ['🔄从L取能'], reusePath)) return;
-            
-            var storage = room.storage;
-            if (storage && this.doAction(creep, storage, creep.withdraw, '#ffff00', ['🔄从S取能'], reusePath)) return;
-            
-            var container = this.getNearContainer(creep.pos, true);
-            if (container && this.doAction(creep, container, creep.withdraw, '#ffaa00', ['🔄从C取能'], reusePath)) return;
-        }
-    },
-
-    refillCoreForTransporter: function(creep, reusePath) {
-        var room = creep.room;
-        var coreStructures = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) {
-                return (s.structureType === STRUCTURE_SPAWN || s.structureType === STRUCTURE_EXTENSION) 
-                    && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
-            }
-        });
-        if (coreStructures.length > 0) {
-            this.doAction(creep, coreStructures[0], creep.transfer, '#66ff66', ['⚡运输能源'], reusePath);
-            return;
-        }
-        var tower = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) {
-                return s.structureType === STRUCTURE_TOWER 
-                && s.store.getFreeCapacity(RESOURCE_ENERGY) > 100;
-            }
-        });
-        if (tower.length > 0) {
-            this.doAction(creep, tower[0], creep.transfer, '#ff0000', ['⚡补充T能量'], reusePath);
-            return;
-        }
-        var storage = room.storage;
-        if (storage && this.doAction(creep, storage, creep.transfer, '#ffff00', ['⚡向S储能'], reusePath)) return;
-        this.sayWithDuration(creep, ['⚡闲置']);
-    },
-
-    upgradeCtrl: function(creep, reusePath) {
-        var ctrl = creep.room.controller;
-        if (!this.isTargetValid(ctrl)) return;
-        this.sayWithDuration(creep, ['⚡升级控制器','⚡升职加薪啦']);
-        if (creep.upgradeController(ctrl) === ERR_NOT_IN_RANGE) {
-            creep.moveTo(ctrl, this.getMoveOpts(reusePath));
-        }
-    },
-
-    checkStuckAndClearPath: function(creep) {
-        if (!creep.memory.lastPos) {
-            creep.memory.lastPos = {x: creep.pos.x, y: creep.pos.y, tick: Game.time};
-            return false;
-        }
-        var lastPos = creep.memory.lastPos;
-        if (lastPos.x === creep.pos.x && lastPos.y === creep.pos.y) {
-            if (Game.time - lastPos.tick >= 999) {
-                delete creep.memory._move;
-                creep.memory.lastPos = {x: creep.pos.x, y: creep.pos.y, tick: Game.time};
-                this.sayWithDuration(creep, ['🚨缓解卡顿','🚨清理缓存']);
-                console.log('['+creep.name+'] 卡住999tick，已清理寻路缓存');
-                return true;
-            }
-        } else {
-            creep.memory.lastPos = {x: creep.pos.x, y: creep.pos.y, tick: Game.time};
-        }
-        return false;
-    },
-
-    clearAllCreepPathCache: function() {
-        var count = 0;
-        for (var name in Game.creeps) {
-            var creep = Game.creeps[name];
-            if (creep && creep.memory._move) {
-                delete creep.memory._move;
-                count++;
-            }
-        }
-        console.log('['+Game.time+'] 批量清理'+count+'个Creep寻路缓存');
+    // 计算Creep身体成本
+    getBodyCost: function(body) {
+        var costMap = { WORK: 100, CARRY: 50, MOVE: 50, ATTACK: 80, RANGED_ATTACK: 150, TOUGH: 10, CLAIM: 600 };
+        var sum = 0;
+        for (var i = 0; i < body.length; i++) sum += costMap[body[i]] || 0;
+        return sum;
     }
 };
 
-// ===================== 造兵管理器 =====================
+// ===================== 造兵管理器 (需求5：Miner自动生成) =====================
 var SpawnManager = {
     BODIES: {
-        harvester: [WORK,WORK,WORK,WORK,CARRY,CARRY,MOVE,MOVE],
-        transporter: [CARRY,CARRY,CARRY,CARRY,MOVE,MOVE],
-        upgrader: [WORK,WORK,WORK,CARRY,CARRY,MOVE,MOVE,MOVE], 
+        harvester: [WORK,WORK,WORK,WORK,WORK,WORK,CARRY,CARRY,MOVE,MOVE,MOVE,MOVE],
+        transporter: [CARRY,CARRY,CARRY,CARRY,MOVE,MOVE,MOVE,MOVE],
+        upgrader: [WORK,WORK,WORK,WORK,WORK,CARRY,CARRY,CARRY,MOVE,MOVE,MOVE], 
         builder: [WORK,WORK,CARRY,CARRY,CARRY,MOVE,MOVE],
-        defender: [ATTACK,ATTACK,TOUGH,TOUGH,MOVE,MOVE]
+        defender: [RANGED_ATTACK, RANGED_ATTACK, TOUGH, TOUGH, MOVE, MOVE, MOVE],
+        miner: [WORK,WORK,WORK,WORK,WORK,WORK,CARRY,MOVE,MOVE],
+        scout: [MOVE],
+        attacker: [RANGED_ATTACK, RANGED_ATTACK, RANGED_ATTACK, TOUGH, MOVE, MOVE, MOVE]
     },
-    CREEP_NUM: { harvester: 4, transporter: 1, upgrader: 2, builder: 1, defender: 0 },
-    PRIORITY: ['harvester', 'transporter', 'upgrader', 'builder', 'defender'],
-    BODY_COST: {},
-
+    CREEP_NUM: { 
+        harvester: 4, transporter: 1, upgrader: 4, builder: 1, 
+        defender: 0, miner: 0, scout: 0, attacker: 0
+    },
+    PRIORITY: ['harvester', 'transporter', 'upgrader', 'miner', 'builder', 'defender'],
+    
     init: function() {
-        for (var role in this.BODIES) {
-            this.BODY_COST[role] = ToolUtil.getBodyCost(this.BODIES[role]);
-        }
+        this.BODY_COST = {};
+        for (var role in this.BODIES) this.BODY_COST[role] = ToolUtil.getBodyCost(this.BODIES[role]);
     },
 
     run: function(room) {
-        if (Object.keys(this.BODY_COST).length === 0) this.init();
+        if (!this.BODY_COST) this.init();
+        var spawn = room.find(FIND_MY_SPAWNS)[0];
+        if (!spawn || spawn.spawning) return;
 
-        var spawn = room.find(FIND_MY_SPAWNS, {limit:1})[0];
-        if (!ToolUtil.isTargetValid(spawn) || spawn.spawning) return;
+        // 统计数量
+        var counts = {};
+        for (let r in this.CREEP_NUM) counts[r] = 0;
+        room.find(FIND_MY_CREEPS).forEach(c => { if(counts[c.memory.role] !== undefined) counts[c.memory.role]++; });
 
-        // 实时统计creep数量
-        var creepCount = {harvester:0, transporter:0, upgrader:0, builder:0, defender:0};
-        room.find(FIND_MY_CREEPS).forEach(c => {
-            if (creepCount[c.memory.role] !== undefined) creepCount[c.memory.role]++;
-        });
+        // 需求5：动态检查 Z 矿
+        const zMineral = ToolUtil.assignZynthiumMineral(null, room);
+        const extractor = zMineral ? zMineral.pos.lookFor(LOOK_STRUCTURES).find(s => s.structureType === STRUCTURE_EXTRACTOR) : null;
+        
+        // 如果有 Z 矿、有提取器、且矿没枯竭，保持 1 个 Miner
+        if (zMineral && extractor && zMineral.mineralAmount > 0) {
+            this.CREEP_NUM.miner = 1;
+        } else {
+            this.CREEP_NUM.miner = 0;
+        }
 
-        var currentEnergy = room.energyAvailable;
-
+        // 孵化逻辑
         for (var i = 0; i < this.PRIORITY.length; i++) {
             var role = this.PRIORITY[i];
-            if (creepCount[role] >= this.CREEP_NUM[role]) continue;
-
-            var fullCost = this.BODY_COST[role];
-            var body = currentEnergy >= fullCost ? this.BODIES[role] : [WORK,CARRY,MOVE];
-
-            var name = role + '_' + Game.time;
-            var result = spawn.spawnCreep(body, name, {
-                memory: { 
-                    role: role, 
-                    working: false, 
-                    room: room.name,
-                    currentSourceTaskId: null, // 初始化source任务ID
-                    sourceChangeCooldown: 0 // 初始化调整冷却
-                }
-            });
+            if (counts[role] >= this.CREEP_NUM[role]) continue;
             
-            if (result === OK) {
-                console.log(`[${room.name}] 孵化爬爬：${name} | 角色：${role} | 身体：[${body.join(',')}]`);
+            var body = room.energyAvailable >= this.BODY_COST[role] ? this.BODIES[role] : [WORK,CARRY,MOVE];
+            var name = role + '_' + Game.time;
+            var mem = { role: role, working: false, room: room.name };
+            
+            if (spawn.spawnCreep(body, name, {memory: mem}) === OK) {
+                console.log(`[Spawn] 孵化 ${name}`);
                 return;
             }
         }
     }
 };
 
-// ===================== Creep逻辑 =====================
+// ===================== Creep逻辑 (中文任务描述 + 保留核心) =====================
 var CreepLogic = {
-    COLOR: { harvester: '#ffaa00', transporter: '#00ffcc', upgrader: '#66ff66', builder: '#ffff00', defender: '#ff0000' },
-
     run: function(room) {
-        // 实时遍历所有creep
-        var allCreeps = room.find(FIND_MY_CREEPS);
-        allCreeps.forEach(creep => {
+        room.find(FIND_MY_CREEPS).forEach(creep => {
             if (!ToolUtil.isTargetValid(creep)) return;
-            ToolUtil.checkStuckAndClearPath(creep);
             this.switchState(creep);
-            if (this[creep.memory.role]) {
-                this[creep.memory.role](creep);
-            }
+            if (this[creep.memory.role]) this[creep.memory.role](creep);
         });
     },
 
     switchState: function(creep) {
-        var used = creep.store.getUsedCapacity(RESOURCE_ENERGY);
-        var free = creep.store.getFreeCapacity(RESOURCE_ENERGY);
+        if (['defender', 'scout', 'attacker'].includes(creep.memory.role)) return;
         
-        if (used === 0) {
+        const resType = creep.memory.role === 'miner' ? RESOURCE_ZYNTHIUM : RESOURCE_ENERGY;
+        const used = creep.store.getUsedCapacity(resType);
+        const free = creep.store.getFreeCapacity(resType);
+
+        if (used === 0 && creep.memory.working) {
             creep.memory.working = false;
             delete creep.memory._move;
-            // 能量空了，重置任务状态（可以重新分配source）
-            // 注意：不删除currentSourceTaskId，让assignSource判定是否需要重新分配
-        } else if (free === 0) {
+            delete creep.memory.taskTargetId; // 清除任务缓存
+        } else if (free === 0 && !creep.memory.working) {
             creep.memory.working = true;
             delete creep.memory._move;
-            // 能量满了，标记任务完成（但保留currentSourceTaskId，等下次采集时判定）
-        }
-
-        if (creep.memory.working && used === 0) {
-            creep.memory.working = false;
-            delete creep.memory._move;
-            ToolUtil.sayWithDuration(creep, ['🔄取出能源']);
-        } else if (!creep.memory.working && free === 0) {
-            creep.memory.working = true;
-            delete creep.memory._move;
-            ToolUtil.sayWithDuration(creep, ['⚡好好工作','干掉上面']);
+            delete creep.memory.taskTargetId; // 清除任务缓存
         }
     },
 
-    harvester: function(creep) {
-        var room = creep.room;
-        var source = ToolUtil.assignSource(creep, room);
+    // 需求1：Harvester 优先 Link -> Container -> Spawn -> Storage（中文任务描述）
+		harvester: function(creep) {
+		    const room = creep.room;
+		    // 1. 采集阶段
+		    if (!creep.memory.working) {
+		        const source = ToolUtil.assignSource(creep, room);
+		        if (!source) {
+		            console.log(`[Harvester-${creep.name}] 无可用矿源！`);
+		            return;
+		        }
+		        // 中文描述：挖矿
+		        ToolUtil.doAction(creep, source, creep.harvest, '#ffaa00', ['挖矿'], 50, RESOURCE_ENERGY);
+		        return;
+		    }
 
-        if (!source) {
-            ToolUtil.sayWithDuration(creep, ['❌无资源点']);
-            return;
-        }
+		    // 2. 运输阶段 (中文任务描述)
+		    let source = null;
+		    if (creep.memory.currentSourceTaskId) {
+		        source = Game.getObjectById(creep.memory.currentSourceTaskId);
+		    }
+		    if (!ToolUtil.isTargetValid(source)) {
+		        source = ToolUtil.assignSource(creep, room);
+		    }
 
-        if (!creep.memory.working) {
-            // 采集态：任务完成前不切换source
-            ToolUtil.doAction(creep, source, creep.harvest, this.COLOR.harvester, ['⛏️采集能源'], 50);
-            return;
-        }
+		    // 优先级 1: 旁边的 Link - 中文：存矿到链路
+		    if (source) {
+		        const link = ToolUtil.getNearbyStructures(source.pos, STRUCTURE_LINK, false);
+		        if (link && ToolUtil.doAction(creep, link, creep.transfer, '#ffaa00', ['存矿到链路'], 50)) return;
+		    }
 
-        // 能量满了，执行存储逻辑（完成采集任务）
-        // 优先级1：Spawn和Extension
-        var coreStructures = room.find(FIND_MY_STRUCTURES, {
-            filter: function(s) {
-                return (s.structureType === STRUCTURE_SPAWN || s.structureType === STRUCTURE_EXTENSION) 
-                    && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0;
-            },
-            limit: 1
-        })[0];
-        if (ToolUtil.isTargetValid(coreStructures)) {
-            ToolUtil.doAction(creep, coreStructures, creep.transfer, this.COLOR.harvester, ['🏭存入核心设施'], 50);
-            return;
-        }
-        
-        // 优先级2：Source附近的Link
-        var sourceLink = room.find(FIND_MY_STRUCTURES, {
-            filter: s => s.structureType === STRUCTURE_LINK && s.pos.getRangeTo(source) <= 3,
-            limit: 1
-        })[0];
-        if (ToolUtil.isTargetValid(sourceLink) && sourceLink.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-            ToolUtil.doAction(creep, sourceLink, creep.transfer, this.COLOR.harvester, ['🔗存入L'], 50);
-            return;
-        }
-        
-        // 优先级3：Source附近的Container
-        var container = ToolUtil.getNearContainer(source.pos, false);
-        if (ToolUtil.isTargetValid(container) && container.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-            ToolUtil.doAction(creep, container, creep.transfer, this.COLOR.harvester, ['📦存入C'], 50);
-            return;
-        }
-        
-        // 优先级4：Storage
-        var storage = room.storage;
-        if (ToolUtil.isTargetValid(storage) && storage.store.getFreeCapacity(RESOURCE_ENERGY) > 0) {
-            ToolUtil.doAction(creep, storage, creep.transfer, this.COLOR.harvester, ['🗄️存入S'], 50);
-            return;
-        }
+		    // 优先级 2: 旁边的 Container - 中文：存矿到容器
+		    if (source) {
+		        const cont = ToolUtil.getNearbyStructures(source.pos, STRUCTURE_CONTAINER, false);
+		        if (cont && ToolUtil.doAction(creep, cont, creep.transfer, '#ffaa00', ['存矿到容器'], 50)) return;
+		    }
 
-        ToolUtil.sayWithDuration(creep, ['📥已满，加班去']);
-        creep.memory.working = false;
-        delete creep.memory._move;
-    },
+		    // 优先级 3: Spawn/Extension - 中文：送矿到孵化
+		    const core = creep.pos.findClosestByPath(FIND_STRUCTURES, {
+		        filter: s => (s.structureType === STRUCTURE_SPAWN || s.structureType === STRUCTURE_EXTENSION) 
+		                     && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0
+		    });
+		    if (core && ToolUtil.doAction(creep, core, creep.transfer, '#ffaa00', ['送矿到孵化'], 50)) return;
 
-    transporter: function(creep) {
-        if (!creep.memory.working) {
-            ToolUtil.getEnergyForTransporter(creep, 20);
-            return;
-        }
-        ToolUtil.refillCoreForTransporter(creep, 20);
-    },
+		    // 优先级 4: Storage - 中文：存矿到仓库
+		    if (room.storage && ToolUtil.doAction(creep, room.storage, creep.transfer, '#ffaa00', ['存矿到仓库'], 50)) return;
+		},
 
+    // 需求3：重写 Transporter 逻辑（彻底解决往返Storage问题）
+		transporter: function(creep) {
+		    const room = creep.room;
+		    const RES_TYPE = RESOURCE_ENERGY;
+		    const TARGET_LOCK_TICK = 10; // 目标锁定时长（避免频繁换目标）
+
+		    // ===================== 核心工具函数（内部复用） =====================
+		    // 检查缓存目标是否有效
+		    const isCachedTargetValid = (targetId, isWithdraw) => {
+		        if (!targetId) return false;
+		        const target = Game.getObjectById(targetId);
+		        if (!ToolUtil.isTargetValid(target)) return false;
+		        
+		        // 取货目标：需有足够能量，且Creep有空间
+		        if (isWithdraw) {
+		            return target.store.getUsedCapacity(RES_TYPE) > 50 
+		                && creep.store.getFreeCapacity(RES_TYPE) > 0;
+		        }
+		        // 送货目标：需有足够空间，且Creep有能量
+		        return target.store.getFreeCapacity(RES_TYPE) > 0 
+		            && creep.store.getUsedCapacity(RES_TYPE) > 0;
+		    };
+
+		    // 锁定目标到内存
+		    const lockTarget = (target, type) => {
+		        creep.memory.taskTargetId = target.id;
+		        creep.memory.targetLockExpire = Game.time + TARGET_LOCK_TICK;
+		        creep.memory.targetType = type; // 'withdraw' 或 'transfer'
+		        console.log(`[Transporter-${creep.name}] 锁定${type}目标：${target.structureType}(${target.pos.x},${target.pos.y})`);
+		    };
+
+		    // ===================== 取货阶段（!working） =====================
+		    if (!creep.memory.working) {
+		        // 1. 检查缓存取货目标是否有效
+		        if (creep.memory.taskTargetId && creep.memory.targetType === 'withdraw' 
+		            && Game.time < creep.memory.targetLockExpire 
+		            && isCachedTargetValid(creep.memory.taskTargetId, true)) {
+		            const target = Game.getObjectById(creep.memory.taskTargetId);
+		            ToolUtil.doAction(creep, target, creep.withdraw, '#00ffcc', ['取能量'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 2. 清空失效缓存
+		        delete creep.memory.taskTargetId;
+		        delete creep.memory.targetLockExpire;
+		        delete creep.memory.targetType;
+
+		        // 3. 严格优先级取货（优先取"溢出"能量，最后才碰Storage）
+		        let target = null;
+		        // 优先级1：矿边Link（能量>800，溢出）
+		        target = room.find(FIND_MY_STRUCTURES, {
+		            filter: s => s.structureType === STRUCTURE_LINK 
+		                        && s.pos.findInRange(FIND_SOURCES, 2).length > 0
+		                        && s.store.getUsedCapacity(RES_TYPE) > 800
+		        })[0];
+		        if (target) {
+		            lockTarget(target, 'withdraw');
+		            ToolUtil.doAction(creep, target, creep.withdraw, '#00ffcc', ['取链路能量'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 优先级2：孵化边Link（能量>800，溢出）
+		        target = room.find(FIND_MY_STRUCTURES, {
+		            filter: s => s.structureType === STRUCTURE_LINK 
+		                        && s.pos.findInRange(FIND_MY_SPAWNS, 3).length > 0
+		                        && s.store.getUsedCapacity(RES_TYPE) > 800
+		        })[0];
+		        if (target) {
+		            lockTarget(target, 'withdraw');
+		            ToolUtil.doAction(creep, target, creep.withdraw, '#00ffcc', ['取链路能量'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 优先级3：矿边Container（能量>800，溢出）
+		        target = room.find(FIND_STRUCTURES, {
+		            filter: s => s.structureType === STRUCTURE_CONTAINER 
+		                        && s.pos.findInRange(FIND_SOURCES, 2).length > 0
+		                        && s.store.getUsedCapacity(RES_TYPE) > 800
+		        })[0];
+		        if (target) {
+		            lockTarget(target, 'withdraw');
+		            ToolUtil.doAction(creep, target, creep.withdraw, '#00ffcc', ['取容器能量'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 优先级4：地上能量（堆>500）
+		        target = creep.pos.findClosestByPath(FIND_DROPPED_RESOURCES, {
+		            filter: r => r.resourceType === RES_TYPE && r.amount > 500
+		        });
+		        if (target) {
+		            lockTarget(target, 'withdraw');
+		            ToolUtil.doAction(creep, target, creep.pickup, '#00ffcc', ['捡地上能量'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 优先级5：全局Container（能量>800，最后兜底）
+		        target = room.find(FIND_STRUCTURES, {
+		            filter: s => s.structureType === STRUCTURE_CONTAINER 
+		                        && s.store.getUsedCapacity(RES_TYPE) > 800
+		        })[0];
+		        if (target) {
+		            lockTarget(target, 'withdraw');
+		            ToolUtil.doAction(creep, target, creep.withdraw, '#00ffcc', ['取容器能量'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 优先级6：Storage（仅当其他无货时，且Storage能量>10000）
+		        if (room.storage && room.storage.store.getUsedCapacity(RES_TYPE) > 10000) {
+		            lockTarget(room.storage, 'withdraw');
+		            ToolUtil.doAction(creep, room.storage, creep.withdraw, '#00ffcc', ['取仓库能量'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 无可用取货目标：待命
+		        ToolUtil.sayWithDuration(creep, ['暂无货源']);
+		        creep.moveTo(room.controller.pos, ToolUtil.getMoveOpts(50));
+		        return;
+		    }
+
+		    // ===================== 送货阶段（working） =====================
+		    if (creep.memory.working) {
+		        // 1. 检查缓存送货目标是否有效
+		        if (creep.memory.taskTargetId && creep.memory.targetType === 'transfer' 
+		            && Game.time < creep.memory.targetLockExpire 
+		            && isCachedTargetValid(creep.memory.taskTargetId, false)) {
+		            const target = Game.getObjectById(creep.memory.taskTargetId);
+		            ToolUtil.doAction(creep, target, creep.transfer, '#00ffcc', ['送能量'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 2. 清空失效缓存
+		        delete creep.memory.taskTargetId;
+		        delete creep.memory.targetLockExpire;
+		        delete creep.memory.targetType;
+
+		        // 3. 严格优先级送货（优先填充"急需"建筑，最后才回Storage）
+		        let target = null;
+		        // 优先级1：Spawn/Extension（完全空的优先）
+		        target = creep.pos.findClosestByPath(FIND_MY_STRUCTURES, {
+		            filter: s => (s.structureType === STRUCTURE_SPAWN || s.structureType === STRUCTURE_EXTENSION)
+		                        && s.store.getFreeCapacity(RES_TYPE) === s.store.getCapacity(RES_TYPE)
+		        });
+		        if (!target) { // 无完全空的，找有空间的
+		            target = creep.pos.findClosestByPath(FIND_MY_STRUCTURES, {
+		                filter: s => (s.structureType === STRUCTURE_SPAWN || s.structureType === STRUCTURE_EXTENSION)
+		                            && s.store.getFreeCapacity(RES_TYPE) > 0
+		            });
+		        }
+		        if (target) {
+		            lockTarget(target, 'transfer');
+		            ToolUtil.doAction(creep, target, creep.transfer, '#00ffcc', ['送能量到孵化'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 优先级2：Tower（能量<50%，防御/维修急需）
+		        target = creep.pos.findClosestByPath(FIND_MY_STRUCTURES, {
+		            filter: s => s.structureType === STRUCTURE_TOWER
+		                        && s.store.getUsedCapacity(RES_TYPE) < s.store.getCapacity(RES_TYPE) * 0.5
+		        });
+		        if (target) {
+		            lockTarget(target, 'transfer');
+		            ToolUtil.doAction(creep, target, creep.transfer, '#00ffcc', ['送能量到塔楼'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 优先级3：Lab（需要能量且有空位）
+		        target = creep.pos.findClosestByPath(FIND_MY_STRUCTURES, {
+		            filter: s => s.structureType === STRUCTURE_LAB
+		                        && s.store.getFreeCapacity(RES_TYPE) > 0
+		        });
+		        if (target) {
+		            lockTarget(target, 'transfer');
+		            ToolUtil.doAction(creep, target, creep.transfer, '#00ffcc', ['送能量到实验室'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 优先级4：Terminal（能量<保底值）
+		        if (room.terminal && room.terminal.store.getFreeCapacity(RES_TYPE) > 0 
+		            && room.terminal.store.getUsedCapacity(RES_TYPE) < GLOBAL_CONFIG.TERMINAL.KEEP_ENERGY) {
+		            lockTarget(room.terminal, 'transfer');
+		            ToolUtil.doAction(creep, room.terminal, creep.transfer, '#00ffcc', ['送能量到终端'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 优先级5：Storage（仅当所有建筑都满了才回存）
+		        if (room.storage && room.storage.store.getFreeCapacity(RES_TYPE) > 0) {
+		            lockTarget(room.storage, 'transfer');
+		            ToolUtil.doAction(creep, room.storage, creep.transfer, '#00ffcc', ['存能量到仓库'], 20, RES_TYPE);
+		            return;
+		        }
+
+		        // 无可用送货目标：待命
+		        ToolUtil.sayWithDuration(creep, ['暂无需求']);
+		        creep.moveTo(room.spawns[Object.keys(room.spawns)[0]].pos, ToolUtil.getMoveOpts(50));
+		        return;
+		    }
+		},
+
+    // 需求2：Upgrader 取能逻辑（中文任务描述）
     upgrader: function(creep) {
+        const room = creep.room;
         if (!creep.memory.working) {
-            ToolUtil.getEnergyForUpgraderAndBuilder(creep, 50);
+            // 1. 优先：控制器旁边的 Link - 中文：取链路能量
+            const ctrlLink = room.find(FIND_MY_STRUCTURES, {
+                filter: s => s.structureType === STRUCTURE_LINK && 
+                             s.pos.inRangeTo(room.controller, 3) &&
+                             s.store.getUsedCapacity(RESOURCE_ENERGY) > 0
+            })[0];
+            if (ctrlLink && ToolUtil.doAction(creep, ctrlLink, creep.withdraw, '#66ff66', ['取链路能量'], 50)) return;
+
+            // 2. 其次：Source 旁边的 Container - 中文：取容器能量
+            const sourceCont = room.find(FIND_STRUCTURES, {
+                filter: s => s.structureType === STRUCTURE_CONTAINER && 
+                             s.store.getUsedCapacity(RESOURCE_ENERGY) > 500
+            })[0];
+            if (sourceCont && ToolUtil.doAction(creep, sourceCont, creep.withdraw, '#66ff66', ['取容器能量'], 50)) return;
+
+            // 3. 兜底：Storage - 中文：取仓库能量
+            if (room.storage && room.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                ToolUtil.doAction(creep, room.storage, creep.withdraw, '#66ff66', ['取仓库能量'], 50);
+            }
             return;
         }
-        ToolUtil.upgradeCtrl(creep, 50);
+        
+        // 升级控制器 - 中文：升级控制器
+        ToolUtil.sayWithDuration(creep, ['升级控制器']);
+        if (creep.upgradeController(room.controller) === ERR_NOT_IN_RANGE) {
+            creep.moveTo(room.controller, ToolUtil.getMoveOpts(50));
+        }
     },
 
+    // Builder逻辑（中文任务描述）
     builder: function(creep) {
-        var room = creep.room;
+        const room = creep.room;
         if (!creep.memory.working) {
-            ToolUtil.getEnergyForUpgraderAndBuilder(creep, 20);
-            return;
-        }
+            // 取能逻辑 - 中文描述和upgrader一致
+            const ctrlLink = room.find(FIND_MY_STRUCTURES, {
+                filter: s => s.structureType === STRUCTURE_LINK && 
+                             s.pos.inRangeTo(room.controller, 3) &&
+                             s.store.getUsedCapacity(RESOURCE_ENERGY) > 0
+            })[0];
+            if (ctrlLink && ToolUtil.doAction(creep, ctrlLink, creep.withdraw, '#66ff66', ['取链路能量'], 50)) return;
 
-        // 优先级1：核心建筑建造
-        var coreSite = room.find(FIND_CONSTRUCTION_SITES, {
-            filter: function(s) {
-                return [STRUCTURE_SPAWN, STRUCTURE_EXTENSION, STRUCTURE_TOWER, STRUCTURE_STORAGE, STRUCTURE_LINK].includes(s.structureType);
-            },
-            limit: 1
+            const sourceCont = room.find(FIND_STRUCTURES, {
+                filter: s => s.structureType === STRUCTURE_CONTAINER && 
+                             s.store.getUsedCapacity(RESOURCE_ENERGY) > 500
+            })[0];
+            if (sourceCont && ToolUtil.doAction(creep, sourceCont, creep.withdraw, '#66ff66', ['取容器能量'], 50)) return;
+
+            if (room.storage && room.storage.store.getUsedCapacity(RESOURCE_ENERGY) > 0) {
+                ToolUtil.doAction(creep, room.storage, creep.withdraw, '#66ff66', ['取仓库能量'], 50);
+            }
+            return;
+        }
+        
+        // 建造逻辑 - 中文：建造建筑
+        const constructionSites = room.find(FIND_MY_CONSTRUCTION_SITES);
+        if (constructionSites.length > 0) {
+            const target = creep.pos.findClosestByPath(constructionSites);
+            ToolUtil.sayWithDuration(creep, ['建造建筑']);
+            if (creep.build(target) === ERR_NOT_IN_RANGE) {
+                creep.moveTo(target, ToolUtil.getMoveOpts(50));
+            }
+            return;
+        }
+        
+        // 无建造任务时维修 - 中文：维修建筑
+        const damagedStructures = room.find(FIND_STRUCTURES, {
+            filter: s => s.hits < s.hitsMax && 
+                         s.structureType !== STRUCTURE_WALL && 
+                         s.structureType !== STRUCTURE_RAMPART
         });
-        if (coreSite.length > 0) {
-            ToolUtil.doAction(creep, coreSite[0], creep.build, this.COLOR.builder, ['🔨建造核心设施'], 20);
-            return;
+        if (damagedStructures.length > 0) {
+            const target = creep.pos.findClosestByPath(damagedStructures);
+            ToolUtil.sayWithDuration(creep, ['维修建筑']);
+            if (creep.repair(target) === ERR_NOT_IN_RANGE) {
+                creep.moveTo(target, ToolUtil.getMoveOpts(50));
+            }
         }
-        
-        // 优先级2：普通建筑建造
-        var allSite = room.find(FIND_CONSTRUCTION_SITES, { limit: 1 });
-        if (allSite.length > 0) {
-            ToolUtil.doAction(creep, allSite[0], creep.build, this.COLOR.builder, ['🔨建造普通建筑'], 20);
-            return;
-        }
-        
-        // 优先级3：核心设施维修
-        var coreRepair = room.find(FIND_STRUCTURES, {
-            filter: function(s) { return [STRUCTURE_SPAWN,STRUCTURE_LINK,STRUCTURE_TOWER,STRUCTURE_STORAGE].includes(s.structureType) && s.hits < s.hitsMax * 0.8; },
-            limit: 1
-        });
-        if (coreRepair.length > 0) {
-            ToolUtil.doAction(creep, coreRepair[0], creep.repair, this.COLOR.builder, ['🔧维护核心设施'], 20);
-            return;
-        }
-        
-        // 优先级4：基建维修
-        var civilRepair = room.find(FIND_STRUCTURES, {
-            filter: function(s) { return [STRUCTURE_CONTAINER,STRUCTURE_ROAD].includes(s.structureType) && s.hits < s.hitsMax * 0.5; },
-            limit: 1
-        });
-        if (civilRepair.length > 0) {
-            ToolUtil.doAction(creep, civilRepair[0], creep.repair, this.COLOR.builder, ['🔧维修普通建筑'], 20);
-            return;
-        }
-        
-        // 优先级5：防御设施维修
-        var defRepair = room.find(FIND_STRUCTURES, {
-            filter: function(s) { return [STRUCTURE_WALL,STRUCTURE_RAMPART].includes(s.structureType) && s.hits < 100000; },
-            limit: 1
-        });
-        if (defRepair.length > 0) {
-            ToolUtil.doAction(creep, defRepair[0], creep.repair, this.COLOR.builder, ['🔧维修防御设施'], 20);
-            return;
-        }
-        
-        // 兜底：升级控制器
-        ToolUtil.upgradeCtrl(creep, 20);
     },
 
+    // 防御者逻辑（中文任务描述）
     defender: function(creep) {
-        var room = creep.room;
-        var enemy = room.find(FIND_HOSTILE_CREEPS, { limit: 1 })[0];
-        if (enemy) {
-            ToolUtil.doAction(creep, enemy, creep.attack, this.COLOR.defender, ['⚔️防御启动'], 20);
+        const room = creep.room;
+        const hostiles = room.find(FIND_HOSTILE_CREEPS);
+        if (hostiles.length > 0) {
+            // 中文：攻击敌人
+            const target = creep.pos.findClosestByPath(hostiles);
+            ToolUtil.sayWithDuration(creep, ['攻击敌人']);
+            if (creep.rangedAttack(target) === ERR_NOT_IN_RANGE) {
+                creep.moveTo(target, ToolUtil.getMoveOpts(50));
+            }
         } else {
-            var patrolTarget = Game.time % 100 < 50 ? room.find(FIND_MY_SPAWNS, {limit:1})[0] : room.controller;
-            if (patrolTarget) creep.moveTo(patrolTarget, ToolUtil.getMoveOpts(20));
-            ToolUtil.sayWithDuration(creep, ['🛡️巡逻中']);
+            // 中文：房间待命
+            ToolUtil.sayWithDuration(creep, ['房间待命']);
+            creep.moveTo(25, 25, ToolUtil.getMoveOpts(50));
+        }
+    },
+
+    // Miner 逻辑（中文任务描述）
+    miner: function(creep) {
+        const room = creep.room;
+        if (!creep.memory.working) {
+            // 中文：开采Z矿
+            const mineral = ToolUtil.assignZynthiumMineral(creep, room);
+            if (mineral) ToolUtil.doAction(creep, mineral, creep.harvest, '#9900ff', ['开采Z矿'], 50, RESOURCE_ZYNTHIUM);
+        } else {
+            // 优先放 Terminal - 中文：存Z矿到终端；其次 Storage - 中文：存Z矿到仓库
+            let target = room.terminal;
+            let taskText = '存Z矿到终端';
+            if (!target || target.store.getFreeCapacity(RESOURCE_ZYNTHIUM) === 0) {
+                target = room.storage;
+                taskText = '存Z矿到仓库';
+            }
+            
+            if (target) ToolUtil.doAction(creep, target, creep.transfer, '#9900ff', [taskText], 50, RESOURCE_ZYNTHIUM);
         }
     }
 };
 
-// ===================== Tower管理器 =====================
+// ===================== Tower管理器 (需求4：强化防御) =====================
 var TowerManager = {
-    MIN_ENERGY: 200,
     run: function(room) {
-        if (Game.time % 5 !== 0) return;
-        var towers = room.find(FIND_MY_STRUCTURES, { filter: { structureType: STRUCTURE_TOWER }, limit: 2 });
+        const towers = room.find(FIND_MY_STRUCTURES, {
+            filter: s => s.structureType === STRUCTURE_TOWER && s.store.getUsedCapacity(RESOURCE_ENERGY) > 10
+        });
         if (towers.length === 0) return;
 
-        var enemy = room.find(FIND_HOSTILE_CREEPS, { limit: 1 })[0];
-        if (enemy) {
-            towers.forEach((tower, idx) => {
-                if (tower.store.getUsedCapacity(RESOURCE_ENERGY) >= 10) {
-                    tower.attack(enemy);
-                    console.log(`[${room.name}] Tower${idx+1}攻击敌人：${enemy.name || enemy.id}`);
-                }
+        // 1. 绝对优先：攻击
+        const hostiles = room.find(FIND_HOSTILE_CREEPS);
+        if (hostiles.length > 0) {
+            hostiles.sort((a, b) => {
+                const aThreat = a.getActiveBodyparts(CLAIM) * 100 + a.getActiveBodyparts(ATTACK);
+                const bThreat = b.getActiveBodyparts(CLAIM) * 100 + b.getActiveBodyparts(ATTACK);
+                if (bThreat !== aThreat) return bThreat - aThreat;
+                return a.hits - b.hits;
             });
+            
+            towers.forEach(t => t.attack(hostiles[0]));
             return;
         }
 
-        towers.forEach(tower => {
-            if (tower.store.getUsedCapacity(RESOURCE_ENERGY) <= this.MIN_ENERGY) return;
+        // 2. 其次：治疗
+        const injured = room.find(FIND_MY_CREEPS, {filter: c => c.hits < c.hitsMax});
+        if (injured.length > 0) {
+            towers.forEach(t => t.heal(injured[0]));
+            return;
+        }
 
-            var coreTarget = room.find(FIND_STRUCTURES, {
-                filter: function(s) {
-                    return [STRUCTURE_SPAWN, STRUCTURE_LINK, STRUCTURE_STORAGE, STRUCTURE_TOWER].includes(s.structureType) 
-                        && s.hits < s.hitsMax * 0.8;
-                },
-                limit: 1
-            })[0];
-            if (coreTarget) { tower.repair(coreTarget); return; }
-
-            var civilTarget = room.find(FIND_STRUCTURES, {
-                filter: function(s) {
-                    return [STRUCTURE_CONTAINER, STRUCTURE_ROAD].includes(s.structureType) 
-                    && s.hits < s.hitsMax * 0.5;
-                },
-                limit: 1
-            })[0];
-            if (civilTarget) { tower.repair(civilTarget); return; }
-
-            var defTarget = room.find(FIND_STRUCTURES, {
-                filter: function(s) {
-                    return [STRUCTURE_WALL, STRUCTURE_RAMPART].includes(s.structureType) 
-                    && s.hits < 100000;
-                },
-                limit: 1
-            })[0];
-            if (defTarget) tower.repair(defTarget);
+        // 3. 最后：维修 (只有能量大于 500 时才修，节省能量)
+        if (towers[0].store.getUsedCapacity(RESOURCE_ENERGY) < 500) return;
+        
+        const targets = room.find(FIND_STRUCTURES, {
+            filter: s => s.hits < s.hitsMax && 
+                         s.structureType !== STRUCTURE_WALL && 
+                         s.structureType !== STRUCTURE_RAMPART
         });
+        const walls = room.find(FIND_STRUCTURES, {
+            filter: s => (s.structureType === STRUCTURE_WALL || s.structureType === STRUCTURE_RAMPART) && s.hits < 10000
+        });
+        
+        const repairTarget = targets[0] || walls[0];
+        if (repairTarget) towers[0].repair(repairTarget);
     }
 };
 
-// ===================== Link管理器（3个Link互通有无）=====================
+// ===================== Link管理器 (微调配合 Harvester) =====================
 var LinkManager = {
-    // 配置项：Link传输阈值
-    SEND_THRESHOLD: 800,    // 超过此值需要发送能量
-    RECEIVE_THRESHOLD: 200, // 低于此值需要接收能量
-    MIN_TRANSFER: 100,      // 最小传输量，避免小额无效传输
-    
     run: function(room) {
-        if (Game.time % 10 !== 0) return;
-        
-        // 1. 动态查找所有Link并分类
-        var allLinks = room.find(FIND_MY_STRUCTURES, { filter: { structureType: STRUCTURE_LINK } });
-        if (allLinks.length < 3) {
-            console.log(`[${room.name}] Link数量不足3个，跳过Link调度`);
-            return;
-        }
-        
-        // 识别三个Link的角色
-        var sourceLink = allLinks.find(link => link.pos.findInRange(FIND_SOURCES, 3).length > 0);
-        var controllerLink = allLinks.find(link => link.pos.findInRange(FIND_MY_CONTROLLERS, 3).length > 0);
-        var spawnLink = allLinks.find(link => link.pos.findInRange(FIND_MY_SPAWNS, 3).length > 0);
-        
-        // 校验所有Link都存在
-        if (!sourceLink || !controllerLink || !spawnLink) {
-            console.log(`[${room.name}] 无法识别全部3个Link角色，跳过调度`);
-            return;
-        }
+        if (Game.time % 5 !== 0) return;
+        const links = room.find(FIND_MY_STRUCTURES, {filter: s => s.structureType === STRUCTURE_LINK});
+        if (links.length < 2) return;
 
-        // 2. 定义辅助函数：执行Link传输
-        const transferEnergy = (sender, receiver, minFree = this.MIN_TRANSFER) => {
-            // 校验条件：发送方有能量、接收方有空间、发送方无冷却
-            if (sender.cooldown !== 0) return false;
-            const senderEnergy = sender.store.getUsedCapacity(RESOURCE_ENERGY);
-            const receiverFree = receiver.store.getFreeCapacity(RESOURCE_ENERGY);
-            
-            if (senderEnergy < this.MIN_TRANSFER || receiverFree < minFree) return false;
-            
-            // 计算可传输的最大量（不超过接收方剩余空间，不超过发送方可用能量）
-            const transferAmount = Math.min(senderEnergy, receiverFree);
-            sender.transferEnergy(receiver, transferAmount);
-            console.log(`[${room.name}] Link传输：${sender.pos} → ${receiver.pos} | 数量：${transferAmount}`);
-            return true;
-        };
+        let sourceLink = null; 
+        let ctrlLink = null;   
+        let bufferLink = null; 
 
-        // 3. 智能调度逻辑（优先级：核心设施 > 控制器升级 > 能量平衡）
-        // 优先级1：保障SpawnLink（核心设施）的能量供应
-        if (spawnLink.store.getUsedCapacity(RESOURCE_ENERGY) < this.RECEIVE_THRESHOLD) {
-            // 先从SourceLink取
-            if (sourceLink.store.getUsedCapacity(RESOURCE_ENERGY) > this.MIN_TRANSFER) {
-                if (transferEnergy(sourceLink, spawnLink)) return;
-            }
-            // SourceLink不够，从ControllerLink取（紧急情况）
-            else if (controllerLink.store.getUsedCapacity(RESOURCE_ENERGY) > this.RECEIVE_THRESHOLD + this.MIN_TRANSFER) {
-                if (transferEnergy(controllerLink, spawnLink)) return;
-            }
-        }
+        links.forEach(link => {
+            if (link.pos.findInRange(FIND_SOURCES, 2).length > 0) sourceLink = link;
+            else if (link.pos.inRangeTo(room.controller, 3)) ctrlLink = link;
+            else if (link.pos.findInRange(FIND_MY_SPAWNS, 3).length > 0) bufferLink = link;
+        });
 
-        // 优先级2：保障ControllerLink（升级）的能量供应
-        if (controllerLink.store.getUsedCapacity(RESOURCE_ENERGY) < this.RECEIVE_THRESHOLD) {
-            // 先从SourceLink取
-            if (sourceLink.store.getUsedCapacity(RESOURCE_ENERGY) > this.MIN_TRANSFER) {
-                if (transferEnergy(sourceLink, controllerLink)) return;
-            }
-            // SourceLink不够，从SpawnLink取（SpawnLink有富余时）
-            else if (spawnLink.store.getUsedCapacity(RESOURCE_ENERGY) > this.SEND_THRESHOLD) {
-                if (transferEnergy(spawnLink, controllerLink)) return;
-            }
-        }
-
-        // 优先级3：平衡SourceLink的富余能量（避免浪费）
-        if (sourceLink.store.getUsedCapacity(RESOURCE_ENERGY) >= this.SEND_THRESHOLD) {
-            // 先给SpawnLink补充（未满时）
-            if (spawnLink.store.getFreeCapacity(RESOURCE_ENERGY) > this.MIN_TRANSFER) {
-                if (transferEnergy(sourceLink, spawnLink)) return;
-            }
-            // 再给ControllerLink补充（未满时）
-            else if (controllerLink.store.getFreeCapacity(RESOURCE_ENERGY) > this.MIN_TRANSFER) {
-                if (transferEnergy(sourceLink, controllerLink)) return;
-            }
-        }
-
-        // 优先级4：平衡SpawnLink的富余能量
-        if (spawnLink.store.getUsedCapacity(RESOURCE_ENERGY) >= this.SEND_THRESHOLD) {
-            // 给ControllerLink补充
-            if (controllerLink.store.getFreeCapacity(RESOURCE_ENERGY) > this.MIN_TRANSFER) {
-                if (transferEnergy(spawnLink, controllerLink)) return;
+        if (sourceLink && sourceLink.store.getUsedCapacity(RESOURCE_ENERGY) > 400) {
+            if (bufferLink && bufferLink.store.getFreeCapacity(RESOURCE_ENERGY) > 100) {
+                sourceLink.transferEnergy(bufferLink);
+            } 
+            else if (ctrlLink && ctrlLink.store.getUsedCapacity(RESOURCE_ENERGY) < 100) {
+                sourceLink.transferEnergy(ctrlLink);
             }
         }
     }
 };
 
-// ===================== 房间管理器 =====================
-var RoomManager = {
+// ===================== Terminal 管理器 (整合修复 + 完整逻辑) =====================
+var TerminalManager = {
+    ERROR_MSG: {
+        ERR_NOT_OWNER: "无订单所有权",
+        ERR_NOT_ENOUGH_RESOURCES: "Terminal Z矿不足",
+        ERR_INVALID_TARGET: "订单无效/已过期",
+        ERR_NOT_IN_RANGE: "距离过远（需Terminal）",
+        ERR_TIRED: "Terminal冷却中（需等待10 tick）",
+        ERR_NO_PATH: "无运输路径",
+        ERR_FULL: "买方库存已满",
+        ERR_INVALID_ARGS: "参数错误（订单ID/数量无效）"
+    },
+
     run: function(room) {
-        room.memory = room.memory || {};
-        room.memory.static = room.memory.static || {};
+        const terminal = room.terminal;
+        if (!ToolUtil.isTargetValid(terminal)) {
+            console.log(`[${room.name}] Terminal未建成/无效，跳过Z矿出售`);
+            return;
+        }
+
+        this.manageTerminalEnergy(terminal, room);
+        this.sellZynthium(terminal, room);
+    },
+
+    manageTerminalEnergy: function(terminal, room) {
+        const keepEnergy = GLOBAL_CONFIG.TERMINAL.KEEP_ENERGY;
+        const terminalEnergy = terminal.store.getUsedCapacity(RESOURCE_ENERGY);
+
+        if (terminalEnergy > keepEnergy && ToolUtil.isTargetValid(room.storage)) {
+            const transferAmount = Math.min(terminalEnergy - keepEnergy, 5000);
+            const result = terminal.send(RESOURCE_ENERGY, transferAmount, room.name);
+            if (result === OK) {
+                console.log(`[${room.name}] Terminal转移${transferAmount}能源至Storage（当前：${terminalEnergy}→${terminalEnergy-transferAmount}）`);
+            }
+        }
+    },
+
+    sellZynthium: function(terminal, room) {
+        const config = GLOBAL_CONFIG.TERMINAL;
+        const zAmount = terminal.store.getUsedCapacity(RESOURCE_ZYNTHIUM);
+
+        if (config.COOLDOWN_CHECK && terminal.cooldown > 0) {
+            console.log(`[${room.name}] Terminal处于冷却中（剩余${terminal.cooldown} tick），跳过Z矿出售`);
+            return;
+        }
+
+        if (zAmount < config.SELL_ZYNTHIUM_THRESHOLD) {
+            console.log(`[${room.name}] Z矿库存: ${zAmount}（未达出售阈值${config.SELL_ZYNTHIUM_THRESHOLD}）`);
+            return;
+        }
+
+        const sellableAmount = Math.min(zAmount - config.KEEP_ZYNTHIUM, config.MAX_SINGLE_SELL);
+        if (sellableAmount <= 0) {
+            console.log(`[${room.name}] Z矿库存: ${zAmount}（保留${config.KEEP_ZYNTHIUM}后无可用出售量）`);
+            return;
+        }
+
+        const buyOrders = Game.market.getAllOrders({
+            type: ORDER_BUY,
+            resourceType: RESOURCE_ZYNTHIUM
+        });
+
+        if (buyOrders.length === 0) {
+            console.log(`[${room.name}] 无Z矿收购订单，暂不出售`);
+            return;
+        }
+
+        const validOrders = buyOrders.filter(order => {
+            return order.price >= config.MIN_PRICE && order.amount >= 100;
+        });
+
+        if (validOrders.length === 0) {
+            console.log(`[${room.name}] 无符合条件的Z矿订单（最低可接受价：${config.MIN_PRICE}）`);
+            return;
+        }
+
+        validOrders.sort((a, b) => b.price - a.price);
+        const bestOrder = validOrders[0];
+
+        const dealAmount = Math.min(sellableAmount, bestOrder.amount);
+        const dealResult = Game.market.deal(bestOrder.id, dealAmount, room.name);
+
+        this.logDealResult(room.name, dealResult, dealAmount, bestOrder.price);
+    },
+
+    logDealResult: function(roomName, result, amount, price) {
+        if (result === OK) {
+            const income = Math.floor(amount * price);
+            const fee = Math.floor(income * 0.05);
+            const netIncome = income - fee;
+            console.log(`[${roomName}] Z矿出售成功！
+                数量：${amount} | 单价：${price}
+                毛收入：${income} | 手续费：${fee} | 净收入：${netIncome}`);
+        } else {
+            console.log(`[ERROR][${roomName}] Z矿出售失败！
+                错误码：${result} | 原因：${this.ERROR_MSG[result] || "未知错误（错误码："+result+"）"}`);
+        }
     }
 };
 
-// ===================== 主循环 =====================
+// ===================== Lab 管理器 (保留核心逻辑) =====================
+var LabManager = {
+    run: function(room) {
+        const labs = room.find(FIND_MY_STRUCTURES, {filter: s => s.structureType === STRUCTURE_LAB});
+        if (labs.length < 3) return;
+
+        const labOut = labs[0];
+        const labIn1 = labs[1];
+        const labIn2 = labs[2];
+        
+        const mineral = ToolUtil.assignZynthiumMineral(null, room);
+        if (!mineral) return;
+
+        const z1 = labIn1.store.getUsedCapacity(RESOURCE_ZYNTHIUM);
+        const z2 = labIn2.store.getUsedCapacity(RESOURCE_ZYNTHIUM);
+        
+        if (z1 > 0 && z2 > 0 && labOut.store.getFreeCapacity() > 0) {
+            console.log(`[${room.name}] Lab准备合成Ghodium，输入Z矿：${z1}+${z2}`);
+        }
+    }
+};
+
+// ===================== 主循环 (整合 + 内存清理) =====================
 module.exports.loop = function () {
-    // 清理无效creep内存
-    if (Game.time % 50 === 0) {
+    if (Game.time % 100 === 0) {
         for (var name in Memory.creeps) {
             if (!Game.creeps[name]) delete Memory.creeps[name];
         }
-    }
-    
-    // 定期清理寻路缓存
-    if (Game.time % 200 === 0) ToolUtil.clearAllCreepPathCache();
-    
-    // 定期重置内存
-    if (Game.time % 50000 === 0) {
-        for (var r in Game.rooms) {
-            Game.rooms[r].memory = { static: {} };
-        }
+        console.log(`[清理] 已移除失效Creep内存，当前Creep数量：${Object.keys(Game.creeps).length}`);
     }
 
-    // 运行各管理器
     for (var roomName in Game.rooms) {
         var room = Game.rooms[roomName];
         if (!room.controller || !room.controller.my) continue;
 
-        RoomManager.run(room);
         SpawnManager.run(room);
         LinkManager.run(room);
         TowerManager.run(room);
         CreepLogic.run(room);
+        TerminalManager.run(room);
+        LabManager.run(room);
     }
 };
